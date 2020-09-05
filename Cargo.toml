@@ -5,6 +5,14 @@ authors = ["matthiak00 <matthias.kind@fu-berlin.de>"]
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "streamed_zip_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "streamed-zip-rs-cli"
+path = "src/main.rs"
 
 [dependencies]
 chrono = "0.4.15"
+crc32fast = "1.2.0"
