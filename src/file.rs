@@ -2,22 +2,25 @@ use std::path::PathBuf;
 use crc32fast::Hasher;
 use std::io::{Read, Write, BufWriter};
 
-pub(crate) struct FileToZip {
+pub struct FileToZip {
     last_mod_time: u16,
     last_mod_date: u16,
     crc32: Option<u32>,
-    size: u64,
+    size: Option<u64>,
     file_name: String,
-    original_path: PathBuf,
+    source: Option<Box<dyn Read>>,
     offset_of_fh: u64,
 }
 
+use chrono::{Datelike, Timelike, TimeZone};
+
 impl FileToZip {
     /// Creates a new FileToZip, checks if file exists
-    pub(crate) fn create(path: PathBuf, mut zip_path: String) -> std::io::Result<Self> {
-        if !path.exists() || !path.is_file() {
-            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
-        }
+    pub fn from_file(path: PathBuf, mut zip_path: String) -> std::io::Result<Self> {
+        
+
+        let file = std::fs::File::open(&path)?;
+
         zip_path = zip_path.replace("\\", "/");
         if zip_path.starts_with("/") {
             zip_path.remove(0);
@@ -28,25 +31,45 @@ impl FileToZip {
             .unwrap()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap();
-        use chrono::{Datelike, Timelike, TimeZone};
+        
         let datetime = chrono::Utc.timestamp(unix_t.as_secs() as i64, 0);
+        // black magic msdos time
         let msdos_time = ((datetime.second() as u16) >> 1) | ((datetime.minute() as u16) << 5) | ((datetime.hour() as u16) << 11);
         let msdos_date = (datetime.day() as u16) | ((datetime.month() as u16) << 5) | ((datetime.year() as u16 - 1980) << 9);
-        let size = meta.len();
-
+        
         Ok(Self {
             last_mod_date: msdos_date,
             last_mod_time: msdos_time,
-            size,
+            size: None,
             crc32: None,
             file_name: zip_path,
-            original_path: path,
+            source: Some(Box::new(file)),
             offset_of_fh: 0
         })
     }
 
-    /// writes file entry including file itself, returns bytes written.
-    pub(crate) fn write_file_entry<W: std::io::Write>(&mut self, writer: &mut BufWriter<W>, offset_to_start: u64, buffer: &mut [u8]) -> std::io::Result<u64> {
+    /// can use any Read-implementing source as data
+    /// if `last_mod = None`, the current utc time `chrono::Utc::now()` is used.
+    #[allow(dead_code)]
+    pub fn from_reader(source: Box<dyn Read>, zip_path: String, last_mod: Option<chrono::DateTime<chrono::Utc>>) -> std::io::Result<Self> {
+        let datetime = last_mod.unwrap_or(chrono::Utc::now());
+        // black magic msdos time
+        let msdos_time = ((datetime.second() as u16) >> 1) | ((datetime.minute() as u16) << 5) | ((datetime.hour() as u16) << 11);
+        let msdos_date = (datetime.day() as u16) | ((datetime.month() as u16) << 5) | ((datetime.year() as u16 - 1980) << 9);
+
+        Ok(Self {
+            last_mod_date: msdos_date,
+            last_mod_time: msdos_time,
+            size: None,
+            crc32: None,
+            file_name: zip_path,
+            source: Some(source),
+            offset_of_fh: 0
+        })
+    }
+
+    /// writes file entry including file itself, returns bytes written and the underlying boxed source
+    pub(crate) fn write_file_entry<W: std::io::Write>(&mut self, writer: &mut BufWriter<W>, offset_to_start: u64, buffer: &mut [u8]) -> std::io::Result<(u64, Box<dyn Read>)> {
         // local file header
         // magic number
         self.offset_of_fh = offset_to_start;
@@ -104,15 +127,14 @@ impl FileToZip {
         // b50 + name_len
 
         // write file content
-        let mut file = std::fs::File::open(&self.original_path)?;
+        let mut src = self.source.take().ok_or(std::io::Error::new(std::io::ErrorKind::InvalidData, "No source in ZipFile found"))?;
 
         // copy
-        println!("Writing {:?} ({} bytes)", &self.file_name, self.size);
         let mut crc32 = Hasher::new();
         let mut bytes_written: u64 = 0;
-        writer.flush();
+        writer.flush()?;
         loop {
-            let read_bytes = file.read(buffer)?;
+            let read_bytes = src.read(buffer)?;
             if read_bytes == 0 {
                 break;
             }
@@ -122,7 +144,8 @@ impl FileToZip {
         }
         // b50 + name_len + file_len
 
-        assert_eq!(bytes_written as u64, self.size);
+        // store the bytes written for the central directory entry
+        self.size = Some(bytes_written);
 
         // write data descriptor signature
         writer.write_all(&0x08074b50u32.to_le_bytes())?;
@@ -139,10 +162,12 @@ impl FileToZip {
         writer.write_all(&bytes_written.to_le_bytes())?;
         writer.write_all(&bytes_written.to_le_bytes())?;
         // b74 + name_len + file_len
-        Ok(74u64 + (self.file_name.len() as u64) + bytes_written)
+        Ok((74u64 + (self.file_name.len() as u64) + bytes_written, src))
     }
 
-    pub(crate) fn write_central_dir_entry<W: std::io::Write>(&self, mut writer: W) -> std::io::Result<u64> {
+    /// Writes the central directory entry.
+    /// Only call after write_file_entry was executed, otherwise this must fail because the written size, crc etc. are unknown.
+    pub(crate) fn write_central_dir_entry<W: std::io::Write>(&mut self, mut writer: W) -> std::io::Result<u64> {
         // central directory file header
         // magic number
 
@@ -212,9 +237,10 @@ impl FileToZip {
         writer.write_all(&[1, 0, 24, 0])?;
         // b50 + name_len
         
+        let size = self.size.take().ok_or(std::io::Error::new(std::io::ErrorKind::InvalidData, "Size was None: call write_file_entry first!"))?;
         // uncompressed + compressed size
-        writer.write_all(&self.size.to_le_bytes())?;
-        writer.write_all(&self.size.to_le_bytes())?;
+        writer.write_all(&size.to_le_bytes())?;
+        writer.write_all(&size.to_le_bytes())?;
         // b66 + name_len
         
         // offset
