@@ -4,7 +4,7 @@ use std::path::{PathBuf, Path};
 
 mod file;
 use file::FileToZip;
-use std::io::{Write, BufWriter};
+use std::io::{Write, Read, BufWriter};
 
 pub struct ZipStream<W: Write> {
     sink: BufWriter<W>,
@@ -13,6 +13,7 @@ pub struct ZipStream<W: Write> {
     // 128kb based on https://eklitzke.org/efficient-file-copying-on-linux
     #[cfg(not(target_os = "windows"))]
     buffer: Box<[u8; 131072]>,
+    // 512 kb on windows seem to be fastest
     #[cfg(target_os = "windows")]
     buffer: Box<[u8; 1024 * 512]>,
     bytes_written: u64
@@ -20,12 +21,21 @@ pub struct ZipStream<W: Write> {
 
 impl<W> ZipStream<W> where W: Write {
 
+    /// this adds the file and directly writes its content into the sink
     pub fn add_file(&mut self, path: PathBuf, zip_path: String) -> std::io::Result<u64> {
-        let mut ftz = FileToZip::create(path, zip_path)?;
-        let added = ftz.write_file_entry(&mut self.sink, self.bytes_written, self.buffer.as_mut())?;
+        let mut ftz = FileToZip::from_file(path, zip_path)?;
+        let (added, _) = ftz.write_file_entry(&mut self.sink, self.bytes_written, self.buffer.as_mut())?;
         self.files.push(ftz);
         self.bytes_written += added;
         Ok(added)
+    }
+
+    /// same as `add_file()`, but with manual created `FileToZip`
+    pub fn add_ftz(&mut self, mut ftz: FileToZip) -> std::io::Result<(u64, Box<dyn Read>)> {
+        let (added, source) = ftz.write_file_entry(&mut self.sink, self.bytes_written, self.buffer.as_mut())?;
+        self.files.push(ftz);
+        self.bytes_written += added;
+        Ok((added, source))
     }
 
     pub fn finalize(&mut self) -> std::io::Result<u64> {
@@ -37,7 +47,7 @@ impl<W> ZipStream<W> where W: Write {
         let start_of_central_dir = self.bytes_written;
         let mut central_dir_bytes = 0u64;
         // 1.
-        for file in &self.files {
+        for file in &mut self.files {
             let a = file.write_central_dir_entry(&mut self.sink)?;
             self.bytes_written += a;
             central_dir_bytes += a;
